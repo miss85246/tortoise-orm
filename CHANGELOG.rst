@@ -8,6 +8,13 @@ Changelog
 1.1
 ===
 
+1.1.9
+-----
+
+Added
+^^^^^
+- ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy.
+
 1.1.8
 -----
 
