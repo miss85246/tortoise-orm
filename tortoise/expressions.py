@@ -181,7 +181,7 @@ class F(Expression):
                 int(item) if item.isdigit() else str(item) for item in rest_name_parts.split("__")
             ]
             term = resolve_field_json_path(
-                PypikaField(resolve_context.model._meta.fields_db_projection[main_name_part]),
+                resolve_context.table[resolve_context.model._meta.fields_db_projection[main_name_part]],
                 key_parts,
             )
         elif self.name in resolve_context.annotations:
