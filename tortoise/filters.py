@@ -460,6 +460,40 @@ def get_array_filter(
     }
 
 
+FILTER_SUFFIXES: set[str] = {
+    "",
+    "not",
+    "in",
+    "not_in",
+    "isnull",
+    "not_isnull",
+    "gte",
+    "lte",
+    "gt",
+    "lt",
+    "range",
+    "contains",
+    "startswith",
+    "search",
+    "endswith",
+    "iexact",
+    "icontains",
+    "istartswith",
+    "iendswith",
+    "posix_regex",
+    "iposix_regex",
+    "year",
+    "quarter",
+    "month",
+    "week",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "microsecond",
+}
+
+
 def get_filters_for_field(
     field_name: str, field: Field | None, source_field: str
 ) -> dict[str, FilterInfoDict]:

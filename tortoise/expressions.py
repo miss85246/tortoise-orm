@@ -23,7 +23,7 @@ from tortoise.exceptions import FieldError, OperationalError
 from tortoise.fields.base import Field
 from tortoise.fields.data import JSONField
 from tortoise.fields.relational import RelationalField
-from tortoise.filters import FilterInfoDict
+from tortoise.filters import FILTER_SUFFIXES, FilterInfoDict, get_filters_for_field
 from tortoise.query_utils import (
     QueryModifier,
     TableCriterionTuple,
@@ -462,47 +462,58 @@ class Q:
         if (
             key not in resolve_context.model._meta.filters
             and key.split("__")[0] in resolve_context.model._meta.fetch_fields
-            and self._is_nested_field_path(resolve_context.model, key)
         ):
-            modifier = self._resolve_nested_filter(resolve_context, key, value, table)
+            modifier = self._resolve_relation_filter(resolve_context, key, value, table)
         else:
             criterion, join = self._process_filter_kwarg(resolve_context.model, key, value, table)
             joins = [join] if join else []
             modifier = QueryModifier(where_criterion=criterion, joins=joins)
         return modifier
 
-    @staticmethod
-    def _is_nested_field_path(model: type[Model], key: str) -> bool:
+    def _resolve_relation_filter(
+        self, resolve_context: ResolveContext, key: str, value: Any, table: Table
+    ) -> QueryModifier:
         """
-        Check if a key like ``shed__isnull`` or ``shed__name`` represents a true
-        nested field traversal (returns True for ``shed__name``) vs a filter
-        suffix on a relation field (returns False for ``shed__isnull``).
+        Resolve a filter key that starts with a relation field.
 
-        Walks the ``__``-separated path: each intermediate segment must be a
-        relation field (in ``fetch_fields``), and the last segment must be a
-        real field or relation on the final model.
-
-        Also handles filter suffixes: ``shed__name__in`` returns True because
-        ``shed`` is a relation and ``name`` is a field on the related model.
+        Uses ``FILTER_SUFFIXES`` to distinguish:
+        - ``shed__isnull`` → filter suffix on the FK source column (``shed_id IS NULL``)
+        - ``shed__name`` → nested field traversal (``JOIN shed ... WHERE shed.name = ...``)
         """
         parts = key.split("__")
-        current_model = model
-        saw_relation = False
-        for part in parts:
-            if part in current_model._meta.fetch_fields:
-                saw_relation = True
-                related_field = cast(RelationalField, current_model._meta.fields_map[part])
-                current_model = related_field.related_model
-            elif part in current_model._meta.fields_map:
-                # Found a concrete field — anything after is a filter suffix
-                return True
-            else:
-                # Not a field and not a relation — this is a filter suffix
-                # attached to a relation field (e.g. shed__isnull) where no
-                # concrete field was traversed after the relation.
-                return False
-        # All parts were relations (e.g. shed__coach → returns the FK value)
-        return saw_relation
+        relation_name = parts[0]
+        rest_parts = parts[1:]
+
+        suffix = "__".join(rest_parts)
+        if suffix in FILTER_SUFFIXES:
+            # Filter suffix on the relation field → filter on FK source column
+            relation_field = cast(
+                RelationalField, resolve_context.model._meta.fields_map[relation_name]
+            )
+            fk_source = relation_field.source_field or relation_field.model_field_name
+            # Generate filters for the FK source field and look up the matching one
+            fk_filters = get_filters_for_field(fk_source, None, fk_source)
+            filter_key = f"{fk_source}__{suffix}" if suffix else fk_source
+            if filter_key not in fk_filters:
+                raise FieldError(
+                    f"Unknown filter '{suffix}' for relation '{relation_name}' "
+                    f"(source field '{fk_source}')"
+                )
+            filter_info = fk_filters[filter_key]
+            # Build criterion using the filter info
+            if not isinstance(value, Term):
+                field_object = resolve_context.model._meta.fields_map.get(filter_info["field"])
+                if field_object and "value_encoder" in filter_info:
+                    value = filter_info["value_encoder"](value, resolve_context.model, field_object)
+                elif field_object:
+                    value = field_object.to_db_value(value, resolve_context.model)
+            op = filter_info["operator"]
+            term: Term = table[filter_info.get("source_field", filter_info["field"])]
+            criterion = op(term, value)
+            return QueryModifier(where_criterion=criterion)
+
+        # Nested field traversal (shed__name or shed__name__in etc.)
+        return self._resolve_nested_filter(resolve_context, key, value, table)
 
     def _get_actual_filter_params(
         self, resolve_context: ResolveContext, key: str, value: Table | FilterInfoDict
