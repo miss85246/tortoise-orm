@@ -197,7 +197,7 @@ class F(Expression):
             # a regular model field, e.g. F("id")
             try:
                 meta = resolve_context.model._meta
-                term = PypikaField(meta.fields_db_projection[self.name])
+                term = resolve_context.table[meta.fields_db_projection[self.name]]
 
                 if (output_field := meta.fields_map.get(self.name, None)) and (
                     func := output_field.get_for_dialect(
