@@ -53,6 +53,37 @@ class ResolveResult:
     joins: list[TableCriterionTuple] = dataclass_field(default_factory=list)
     output_field: Field | None = None
 
+    def apply_joins_to(self, target: list[TableCriterionTuple]) -> Term:
+        """
+        Extract the term while merging this result's joins into *target*.
+
+        Use this instead of bare ``.term`` access whenever the caller
+        needs to propagate joins upward.
+
+        Returns self.term so it can be used inline:
+            term = result.apply_joins_to(all_joins)
+        """
+        if self.joins:
+            target.extend(self.joins)
+        return self.term
+
+
+def resolve_expression(
+    value: Any,
+    resolve_context: ResolveContext,
+) -> ResolveResult:
+    """
+    Uniformly resolve a value that might be an Expression, a raw Term,
+    or a constant into a ResolveResult.  This replaces the ad-hoc
+    isinstance checks scattered across the codebase and ensures
+    that joins are always captured in the result.
+    """
+    if isinstance(value, Expression):
+        return value.resolve(resolve_context)
+    if isinstance(value, Term):
+        return ResolveResult(term=value)
+    return ResolveResult(term=Term.wrap_constant(value))
+
 
 class Expression:
     """
@@ -68,11 +99,12 @@ class Value(Expression):
     Wrapper for a value that should be used as a term in a query.
     """
 
-    def __init__(self, value: Any) -> None:
+    def __init__(self, value: Any, output_field: Field | None = None) -> None:
         self.value = value
+        self.output_field = output_field
 
     def resolve(self, resolve_context: ResolveContext) -> ResolveResult:
-        return ResolveResult(term=ValueWrapper(self.value))
+        return ResolveResult(term=ValueWrapper(self.value), output_field=self.output_field)
 
 
 class Connector(Enum):
@@ -158,7 +190,9 @@ class F(Expression):
             if isinstance(annotation, Term):
                 term = annotation
             else:
-                term = annotation.resolve(resolve_context).term
+                annotation_result = annotation.resolve(resolve_context)
+                term = annotation_result.term
+                joins = annotation_result.joins
         else:
             # a regular model field, e.g. F("id")
             try:
@@ -188,40 +222,40 @@ class F(Expression):
     def __neg__(self) -> CombinedExpression:
         return self._combine(-1, Connector.mul, False)
 
-    def __add__(self, other) -> CombinedExpression:
+    def __add__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.add, False)
 
-    def __sub__(self, other) -> CombinedExpression:
+    def __sub__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.sub, False)
 
-    def __mul__(self, other) -> CombinedExpression:
+    def __mul__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.mul, False)
 
-    def __truediv__(self, other) -> CombinedExpression:
+    def __truediv__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.div, False)
 
-    def __mod__(self, other) -> CombinedExpression:
+    def __mod__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.mod, False)
 
-    def __pow__(self, other) -> CombinedExpression:
+    def __pow__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.pow, False)
 
-    def __radd__(self, other) -> CombinedExpression:
+    def __radd__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.add, True)
 
-    def __rsub__(self, other) -> CombinedExpression:
+    def __rsub__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.sub, True)
 
-    def __rmul__(self, other) -> CombinedExpression:
+    def __rmul__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.mul, True)
 
-    def __rtruediv__(self, other) -> CombinedExpression:
+    def __rtruediv__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.div, True)
 
-    def __rmod__(self, other) -> CombinedExpression:
+    def __rmod__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.mod, True)
 
-    def __rpow__(self, other) -> CombinedExpression:
+    def __rpow__(self, other: Expression | str | int | float | bool) -> CombinedExpression:
         return self._combine(other, Connector.pow, True)
 
 
@@ -263,10 +297,10 @@ class Q:
     """
 
     __slots__ = (
+        "_is_negated",
         "children",
         "filters",
         "join_type",
-        "_is_negated",
     )
 
     AND = "AND"
@@ -378,6 +412,8 @@ class Q:
             modifier = QueryModifier(having_criterion=operator(annotation_info.term, value))
         else:
             modifier = QueryModifier(where_criterion=operator(annotation_info.term, value))
+        if annotation_info.joins:
+            modifier = QueryModifier(joins=annotation_info.joins) & modifier
         return modifier
 
     def _process_filter_kwarg(
@@ -436,16 +472,17 @@ class Q:
 
     def _get_actual_filter_params(
         self, resolve_context: ResolveContext, key: str, value: Table | FilterInfoDict
-    ) -> tuple[str, Any]:
+    ) -> tuple[str, Any, list[TableCriterionTuple]]:
         filter_key = key
+        expression_joins: list[TableCriterionTuple] = []
         if (
             key in resolve_context.model._meta.fk_fields
             or key in resolve_context.model._meta.o2o_fields
         ):
-            field_object = resolve_context.model._meta.fields_map[key]
-            value_key = field_object.to_field or "pk"
+            field_object = cast(RelationalField, resolve_context.model._meta.fields_map[key])
             filter_key = cast(str, field_object.source_field)
-            filter_value = getattr(value, value_key, value)
+            to_field_name = field_object.to_field_instance.model_field_name
+            filter_value = getattr(value, to_field_name, value)
         elif key in resolve_context.model._meta.m2m_fields:
             filter_value = getattr(value, "pk", value)
         elif (
@@ -463,14 +500,18 @@ class Q:
             raise FieldError(f"Unknown filter param '{key}'. Allowed base values are {allowed}")
 
         if isinstance(filter_value, Expression):
-            filter_value = filter_value.resolve(resolve_context).term
+            expr_result = filter_value.resolve(resolve_context)
+            filter_value = expr_result.term
+            expression_joins = expr_result.joins
 
-        return filter_key, filter_value
+        return filter_key, filter_value, expression_joins
 
     def _resolve_kwargs(self, resolve_context: ResolveContext) -> QueryModifier:
         modifier = QueryModifier()
         for raw_key, raw_value in self.filters.items():
-            key, value = self._get_actual_filter_params(resolve_context, raw_key, raw_value)
+            key, value, expression_joins = self._get_actual_filter_params(
+                resolve_context, raw_key, raw_value
+            )
             if key in resolve_context.custom_filters:
                 filter_modifier = self._resolve_custom_kwarg(
                     resolve_context, key, value, resolve_context.table
@@ -478,6 +519,13 @@ class Q:
             else:
                 filter_modifier = self._resolve_regular_kwarg(
                     resolve_context, key, value, resolve_context.table
+                )
+
+            if expression_joins:
+                filter_modifier = QueryModifier(
+                    where_criterion=filter_modifier.where_criterion,
+                    joins=filter_modifier.joins + expression_joins,
+                    having_criterion=filter_modifier.having_criterion,
                 )
 
             if self.join_type == self.AND:
@@ -535,14 +583,16 @@ class Function(Expression):
         Enable populate_field_object where we want to try and preserve the field type.
     """
 
-    __slots__ = ("field", "field_object", "default_values")
+    __slots__ = ("default_values", "field", "field_object")
 
     database_func: type[PypikaFunction] = PypikaFunction
     # Enable populate_field_object where we want to try and preserve the field type.
     populate_field_object = False
 
     def __init__(
-        self, field: str | F | CombinedExpression | Function | Term, *default_values: Any
+        self,
+        field: str | F | CombinedExpression | Function | Term | Value,
+        *default_values: Any,
     ) -> None:
         self.field = field
         self.field_object: Field | None = None
@@ -568,7 +618,7 @@ class Function(Expression):
             return ResolveResult(term=value)
         if isinstance(value, str) and treat_str_as_field:
             return self._resolve_nested_field(resolve_context, value)
-        return ResolveResult(term=value)
+        return ResolveResult(term=Term.wrap_constant(value))
 
     def resolve(self, resolve_context: ResolveContext) -> ResolveResult:
         """
@@ -618,7 +668,7 @@ class Aggregate(Function):
 
     def __init__(
         self,
-        field: str | F | CombinedExpression,
+        field: str | F | CombinedExpression | Function | Term | Value,
         *default_values: Any,
         distinct: bool = False,
         _filter: Q | None = None,
@@ -666,7 +716,7 @@ class When(Expression):
     def __init__(
         self,
         *args: Q,
-        then: str | F | CombinedExpression | Function,
+        then: str | F | CombinedExpression | Function | Value,
         negate: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -699,12 +749,14 @@ class When(Expression):
         for node in q_objects:
             modifier &= node.resolve(resolve_context)
 
-        if isinstance(self.then, Expression):
-            then = self.then.resolve(resolve_context).term
-        else:
-            then = cast(Term, Term.wrap_constant(self.then))
+        all_joins = list(modifier.joins)
+        then_result = resolve_expression(self.then, resolve_context)
+        then = then_result.apply_joins_to(all_joins)
 
-        return ResolveResult(term=_WhenThen(modifier.where_criterion, then))
+        return ResolveResult(
+            term=_WhenThen(modifier.where_criterion, then),
+            joins=all_joins,
+        )
 
 
 class Case(Expression):
@@ -718,23 +770,27 @@ class Case(Expression):
     def __init__(
         self,
         *args: When,
-        default: str | F | CombinedExpression | Function | None = None,
+        default: str | F | CombinedExpression | Function | Value | None = None,
     ) -> None:
         self.args = args
         self.default = default
 
     def resolve(self, resolve_context: ResolveContext) -> ResolveResult:
         case = PypikaCase()
+        all_joins: list[TableCriterionTuple] = []
         for arg in self.args:
             if not isinstance(arg, When):
                 raise TypeError("expected When objects as args")
             when = arg.resolve(resolve_context)
             when_term = cast(_WhenThen, when.term)
             case = case.when(when_term.when, when_term.then)
+            if when.joins:
+                all_joins.extend(when.joins)
 
         if isinstance(self.default, Expression):
-            case = case.else_(self.default.resolve(resolve_context).term)
+            default_result = resolve_expression(self.default, resolve_context)
+            case = case.else_(default_result.apply_joins_to(all_joins))
         else:
             case = case.else_(Term.wrap_constant(self.default))
 
-        return ResolveResult(term=case)
+        return ResolveResult(term=case, joins=all_joins)
