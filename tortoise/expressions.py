@@ -462,6 +462,7 @@ class Q:
         if (
             key not in resolve_context.model._meta.filters
             and key.split("__")[0] in resolve_context.model._meta.fetch_fields
+            and self._is_nested_field_path(resolve_context.model, key)
         ):
             modifier = self._resolve_nested_filter(resolve_context, key, value, table)
         else:
@@ -469,6 +470,39 @@ class Q:
             joins = [join] if join else []
             modifier = QueryModifier(where_criterion=criterion, joins=joins)
         return modifier
+
+    @staticmethod
+    def _is_nested_field_path(model: type[Model], key: str) -> bool:
+        """
+        Check if a key like ``shed__isnull`` or ``shed__name`` represents a true
+        nested field traversal (returns True for ``shed__name``) vs a filter
+        suffix on a relation field (returns False for ``shed__isnull``).
+
+        Walks the ``__``-separated path: each intermediate segment must be a
+        relation field (in ``fetch_fields``), and the last segment must be a
+        real field or relation on the final model.
+
+        Also handles filter suffixes: ``shed__name__in`` returns True because
+        ``shed`` is a relation and ``name`` is a field on the related model.
+        """
+        parts = key.split("__")
+        current_model = model
+        saw_relation = False
+        for part in parts:
+            if part in current_model._meta.fetch_fields:
+                saw_relation = True
+                related_field = cast(RelationalField, current_model._meta.fields_map[part])
+                current_model = related_field.related_model
+            elif part in current_model._meta.fields_map:
+                # Found a concrete field — anything after is a filter suffix
+                return True
+            else:
+                # Not a field and not a relation — this is a filter suffix
+                # attached to a relation field (e.g. shed__isnull) where no
+                # concrete field was traversed after the relation.
+                return False
+        # All parts were relations (e.g. shed__coach → returns the FK value)
+        return saw_relation
 
     def _get_actual_filter_params(
         self, resolve_context: ResolveContext, key: str, value: Table | FilterInfoDict
