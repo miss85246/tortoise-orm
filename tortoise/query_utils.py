@@ -16,7 +16,6 @@ from tortoise.exceptions import FieldError, OperationalError
 from tortoise.fields.base import Field
 from tortoise.fields.relational import (
     BackwardFKRelation,
-    ForeignKeyFieldInstance,
     ManyToManyFieldInstance,
     RelationalField,
 )
@@ -115,37 +114,26 @@ def resolve_nested_field(
 
     for iter_field in fields[:-1]:
         related_field = cast(RelationalField, iter_field)
-        joins.extend(get_joins_for_related_field(table, related_field, iter_field.model_field_name))
+        required_joins = get_joins_for_related_field(
+            table, related_field, iter_field.model_field_name
+        )
+        joins.extend(required_joins)
 
         model = related_field.related_model
-        related_table: Table = related_field.related_model._meta.basetable
-        if isinstance(related_field, (ForeignKeyFieldInstance, ManyToManyFieldInstance)):
-            related_table = related_table.as_(
-                f"{table.get_table_name()}__{iter_field.model_field_name}"
-            )
-        table = related_table
+        # Reuse the aliased join table returned by get_joins_for_related_field
+        # so the term references the same table the JOIN was created with.
+        table = required_joins[-1][0]
 
     last_field = fields[-1]
     if last_field.model_field_name in model._meta.fetch_fields:
         related_field = cast(RelationalField, last_field)
         related_field_meta = related_field.related_model._meta
 
-        joins.extend(
-            get_joins_for_related_field(table, related_field, related_field.model_field_name)
+        required_joins = get_joins_for_related_field(
+            table, related_field, related_field.model_field_name
         )
-        related_table = related_field_meta.basetable
-
-        if isinstance(related_field, BackwardFKRelation):
-            if table == related_table:
-                related_table = related_table.as_(
-                    f"{table.get_table_name()}__{related_field.model_field_name}"
-                )
-        elif isinstance(related_field, ManyToManyFieldInstance):
-            related_table = related_table.as_(
-                f"{table.get_table_name()}__{related_field.model_field_name}"
-            )
-
-        term = related_table[related_field_meta.db_pk_column]
+        joins.extend(required_joins)
+        term = required_joins[-1][0][related_field_meta.db_pk_column]
     else:
         if last_field.source_field:
             term = table[last_field.source_field]
