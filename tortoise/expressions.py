@@ -735,6 +735,8 @@ class Aggregate(Function):
         if self.filter:
             modifier = QueryModifier()
             modifier &= self.filter.resolve(resolve_context)
+            if modifier.joins:
+                ret.joins.extend(modifier.joins)
             ret.term = PypikaCase().when(modifier.where_criterion, ret.term).else_(None)
 
         return ret
