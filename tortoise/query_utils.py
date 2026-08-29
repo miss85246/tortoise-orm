@@ -58,8 +58,7 @@ def get_joins_for_related_field(
             or related_field.to_field_instance.model_field_name
         )
 
-        if table == related_table:
-            related_table = related_table.as_(f"{table.get_table_name()}__{related_field_name}")
+        related_table = related_table.as_(f"{table.get_table_name()}__{related_field_name}")
         required_joins.append(
             (
                 related_table,
